@@ -31,7 +31,7 @@ function createUnit(raceStr, casteStr, pos, locationRange, locationType, age, do
     qerror('Invalid location type: ' .. locationType)
   end
   local locationChoices
-  if locationRange then
+  if locationRange then --Continues to the next step
     locationType = locationType or 'Walkable'
     locationChoices = getLocationChoices(pos, locationRange.offset_x, locationRange.offset_y, locationRange.offset_z)
   end
@@ -137,7 +137,7 @@ function createUnitBase(...)
   end
   df.global.world.status.popups:resize(0) -- popups would prevent us from opening the creature creation menu, so remove them temporarily
 
-  local ok, ret = dfhack.pcall(createUnitInner, ...)
+  local ok, ret = dfhack.pcall(createUnitInner, ...) -- Goes to the next creation part
 
   df.global.gametype = old_gametype
   df.global.plotinfo.main.mode = old_mode
@@ -161,14 +161,14 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
   local cursor = copyall(df.global.cursor)
 
   local isArena = dfhack.world.isArena()
-  local arenaSpawn = df.global.world.arena_spawn
+  local arenaSpawn = df.global.world.arena
 
   local oldSpawnType
   local oldSpawnFilter
   oldSpawnType = arenaSpawn.type
   arenaSpawn.type = 0 -- selects the creature at index 0 when the arena spawn screen is produced
-  oldSpawnFilter = arenaSpawn.filter
-  arenaSpawn.filter = "" -- clear filter to prevent it from messing with the selection
+  oldSpawnFilter = arenaSpawn.tree_filter
+  arenaSpawn.tree_filter = "" -- clear filter to prevent it from messing with the selection
 
 -- Clear arena spawn data to avoid interference:
 
@@ -177,7 +177,7 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
   arenaSpawn.interaction = -1
   local oldSpawnTame
   oldSpawnTame = arenaSpawn.tame
-  arenaSpawn.tame = df.world.T_arena_spawn.T_tame.NotTame -- prevent interference by the tame/mountable setting (which isn't particularly useful as it only appears to set unit.flags1.tame)
+  arenaSpawn.tame = arenaSpawn.tame -- prevent interference by the tame/mountable setting (which isn't particularly useful as it only appears to set unit.flags1.tame)
 
   local equipment = arenaSpawn.equipment
 
@@ -290,7 +290,7 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
       end
     end
 
-    gui.simulateInput(dwarfmodeScreen, 'D_LOOK_ARENA_CREATURE') -- open the arena spawning menu
+    gui.simulateInput(dwarfmodeScreen, 'ARENA_CREATE_CREATURE') -- open the arena spawning menu
     local spawnScreen = dfhack.gui.getCurViewscreen() -- df.viewscreen_layer_arena_creaturest
     gui.simulateInput(spawnScreen, 'SELECT') -- create the selected creature
 
@@ -299,7 +299,8 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
     end
 
 --  Process the created unit:
-    local unit = df.unit.find(df.global.unit_next_id-1)
+    --local unit = df.unit.find(df.global.unit_next_id-1)
+	print(unit)
     table.insert(createdUnits, unit)
     processNewUnit(unit, age, domesticate, civ_id, group_id, entityRawName, nickname, vanishDelay, profession, customProfession, flagSet, flagClear, isArena)
   end
@@ -318,7 +319,7 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
   end
   arenaSpawn.creature_cnt:erase(0)
 
-  arenaSpawn.filter = oldSpawnFilter
+  arenaSpawn.tree_filter = oldSpawnFilter
   arenaSpawn.type = oldSpawnType
   arenaSpawn.interaction = oldInteractionEffect
   arenaSpawn.tame = oldSpawnTame
@@ -565,8 +566,9 @@ function createNemesis(unit,civ_id,group_id)
   local nem = df.nemesis_record:new()
 
   nem.id = id
-  nem.unit_id = unit.id
+  print(id)
   nem.unit = unit
+  nem.unit_id = unit.id
   nem.flags:resize(31)
   nem.unk10 = -1
   nem.unk11 = -1
