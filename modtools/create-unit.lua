@@ -161,25 +161,26 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
   local cursor = copyall(df.global.cursor)
 
   local isArena = dfhack.world.isArena()
-  local arenaSpawn = df.global.world.arena_spawn
+  local arenaSpawn = df.global.game.main_interface.arena
+  local arenaALTSpawn = df.global.world.arena
 
   local oldSpawnType
   local oldSpawnFilter
-  oldSpawnType = arenaSpawn.type
-  arenaSpawn.type = 0 -- selects the creature at index 0 when the arena spawn screen is produced
-  oldSpawnFilter = arenaSpawn.filter
-  arenaSpawn.filter = "" -- clear filter to prevent it from messing with the selection
+  oldSpawnType = arenaALTSpawn.type
+  arenaSpawn.anon_2 = 0 -- selects the creature at index 0 when the arena spawn screen is produced
+  oldSpawnFilter = arenaSpawn.anon_8
+  arenaSpawn.anon_8 = "" -- clear filter to prevent it from messing with the selection
 
 -- Clear arena spawn data to avoid interference:
 
   local oldInteractionEffect
-  oldInteractionEffect = arenaSpawn.interaction
-  arenaSpawn.interaction = -1
+  oldInteractionEffect = arenaALTSpawn.interaction
+  arenaALTSpawn.interaction = -1
   local oldSpawnTame
-  oldSpawnTame = arenaSpawn.tame
-  arenaSpawn.tame = df.world.T_arena_spawn.T_tame.NotTame -- prevent interference by the tame/mountable setting (which isn't particularly useful as it only appears to set unit.flags1.tame)
+  oldSpawnTame = arenaSpawn.anon_6
+  --- arenaSpawn.tame = df.world.T_arena_spawn.T_tame.NotTame -- prevent interference by the tame/mountable setting (which isn't particularly useful as it only appears to set unit.flags1.tame)
 
-  local equipment = arenaSpawn.equipment
+  local equipment = arenaALTSpawn.equipment
 
   local old_item_types = {} --as:df.item_type[]
   for _, item_type in pairs(equipment.item_types) do
@@ -225,11 +226,11 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
 
 -- Spawn the creature:
 
-  arenaSpawn.race:insert(0, race_id) -- place at index 0 to allow for straightforward selection as described above. The rest of the list need not be cleared.
+  arenaSpawn.anon_2 = race_id -- place at index 0 to allow for straightforward selection as described above. The rest of the list need not be cleared.
   if caste_id then
     arenaSpawn.caste:insert(0, caste_id) -- if not specificied, caste_id is randomly selected and inserted during the spawn loop below, as otherwise creating multiple creatures simultaneously would result in them all being of the same caste.
   end
-  arenaSpawn.creature_cnt:insert('#', 0)
+  arenaALTSpawn.creature_cnt:insert('#', 0)
 
   local curViewscreen = dfhack.gui.getCurViewscreen()
   local dwarfmodeScreen = df.viewscreen_dwarfmodest:new() -- the viewscreen present in arena "overseer" mode
@@ -266,7 +267,7 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
   local createdUnits = {}
   for n = 1, spawnNumber do -- loop here to avoid having to handle spawn data each time when creating multiple units
     if not caste_id then -- choose a random caste ID each time
-      arenaSpawn.caste:insert(0, caste_id_choices[math.random(1, #caste_id_choices)])
+      arenaSpawn.anon_3 = caste_id_choices[math.random(1, #caste_id_choices)]
     end
 
     if locationChoices then
@@ -290,12 +291,12 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
       end
     end
 
-    gui.simulateInput(dwarfmodeScreen, 'D_LOOK_ARENA_CREATURE') -- open the arena spawning menu
+    gui.simulateInput(dwarfmodeScreen, 'ARENA_CREATE_CREATURE') -- open the arena spawning menu
     local spawnScreen = dfhack.gui.getCurViewscreen() -- df.viewscreen_layer_arena_creaturest
-    gui.simulateInput(spawnScreen, 'SELECT') -- create the selected creature
+    gui.simulateInput(spawnScreen, 'ARENA_CREATE_CREATURE') -- create the selected creature
 
     if not caste_id then
-      arenaSpawn.caste:erase(0)
+      arenaSpawn.anon_3 = 0
     end
 
 --  Process the created unit:
@@ -312,16 +313,16 @@ function createUnitInner(race_id, caste_id, caste_id_choices, pos, locationChoic
 
 -- Restore arena spawn data:
 
-  arenaSpawn.race:erase(0)
+  arenaSpawn.anon_2 = 0
   if caste_id then
-    arenaSpawn.caste:erase(0)
+    arenaSpawn.anon_3 = 0
   end
-  arenaSpawn.creature_cnt:erase(0)
+  arenaALTSpawn.creature_cnt:erase(0)
 
-  arenaSpawn.filter = oldSpawnFilter
-  arenaSpawn.type = oldSpawnType
-  arenaSpawn.interaction = oldInteractionEffect
-  arenaSpawn.tame = oldSpawnTame
+  arenaSpawn.anon_8 = oldSpawnFilter
+  arenaALTSpawn.type = oldSpawnType
+  arenaALTSpawn.interaction = oldInteractionEffect
+  arenaSpawn.anon_6 = oldSpawnTame
 
   if equipDetails then
     equipment.item_types:resize(0)
@@ -563,7 +564,6 @@ end
 function createNemesis(unit,civ_id,group_id)
   local id = df.global.nemesis_next_id
   local nem = df.nemesis_record:new()
-
   nem.id = id
   nem.unit_id = unit.id
   nem.unit = unit
@@ -574,7 +574,7 @@ function createNemesis(unit,civ_id,group_id)
   nem.unk_v47_1 = -1
   nem.unk_v47_2 = -1
   df.global.world.nemesis.all:insert("#",nem)
-  df.global.nemesis_next_id = id+1
+  df.global.nemesis_next_id = id
   unit.general_refs:insert("#",{new = df.general_ref_is_nemesisst, nemesis_id = id})
 
   local he_civ
