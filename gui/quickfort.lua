@@ -1,14 +1,15 @@
 -- A GUI front-end for quickfort
 --@ module = true
 
+-- reload changed transitive dependencies
+reqscript('quickfort').refresh_scripts()
+
 local quickfort_command = reqscript('internal/quickfort/command')
 local quickfort_list = reqscript('internal/quickfort/list')
-local quickfort_map = reqscript('internal/quickfort/map')
 local quickfort_parse = reqscript('internal/quickfort/parse')
 local quickfort_preview = reqscript('internal/quickfort/preview')
 local quickfort_transform = reqscript('internal/quickfort/transform')
 
-local argparse = require('argparse')
 local dialogs = require('gui.dialogs')
 local gui = require('gui')
 local guidm = require('gui.dwarfmode')
@@ -35,7 +36,7 @@ transformations = transformations or {}
 
 -- displays blueprint details, such as the full modeline and comment, that
 -- otherwise might be truncated for length in the blueprint selection list
-local BlueprintDetails = defclass(BlueprintDetails, dialogs.MessageBox)
+BlueprintDetails = defclass(BlueprintDetails, dialogs.MessageBox)
 BlueprintDetails.ATTRS{
     focus_path='quickfort/dialog/details',
     frame_title='Details',
@@ -62,7 +63,7 @@ end
 
 -- blueprint selection dialog, shown when the script starts or when a user wants
 -- to load a new blueprint into the ui
-local BlueprintDialog = defclass(BlueprintDialog, dialogs.ListBox)
+BlueprintDialog = defclass(BlueprintDialog, dialogs.ListBox)
 BlueprintDialog.ATTRS{
     focus_path='quickfort/dialog',
     frame_title='Load quickfort blueprint',
@@ -350,13 +351,13 @@ function Quickfort:init()
                             return #transformations == 0 and 'No transform'
                                 or table.concat(transformations, ', ') end}}}}},
         widgets.HotkeyLabel{key='CUSTOM_O', label='Generate manager orders',
-            active=function() return self.blueprint_name and false end,
-            enabled=function() return self.blueprint_name and false end,
+            active=function() return self.blueprint_name end,
+            enabled=function() return self.blueprint_name end,
             on_activate=self:callback('do_command', 'orders')},
         widgets.HotkeyLabel{key='CUSTOM_SHIFT_O',
             label='Preview manager orders',
-            active=function() return self.blueprint_name and false end,
-            enabled=function() return self.blueprint_name and false end,
+            active=function() return self.blueprint_name end,
+            enabled=function() return self.blueprint_name end,
             on_activate=self:callback('do_command', 'orders', true)},
         widgets.HotkeyLabel{key='CUSTOM_SHIFT_U', label='Undo blueprint',
             active=function() return self.blueprint_name end,
@@ -386,12 +387,19 @@ function Quickfort:get_blueprint_name()
 end
 
 function Quickfort:get_lock_cursor_label()
+    if self.cursor_locked and self.saved_cursor.z ~= df.global.window_z then
+        return 'Zoom to locked position'
+    end
     return (self.cursor_locked and 'Unl' or 'L') .. 'ock blueprint position'
 end
 
 function Quickfort:toggle_lock_cursor()
     if self.cursor_locked then
-        quickfort_map.move_cursor(self.saved_cursor)
+        local was_on_different_zlevel = self.saved_cursor.z ~= df.global.window_z
+        dfhack.gui.revealInDwarfmodeMap(self.saved_cursor)
+        if was_on_different_zlevel then
+            return
+        end
     end
     self.cursor_locked = not self.cursor_locked
 end
@@ -556,6 +564,8 @@ function Quickfort:refresh_preview()
 end
 
 local to_pen = dfhack.pen.parse
+local CURSOR_PEN = to_pen{ch='o', fg=COLOR_BLUE,
+                         tile=dfhack.screen.findGraphicsTile('CURSORS', 5, 22)}
 local GOOD_PEN = to_pen{ch='x', fg=COLOR_GREEN,
                         tile=dfhack.screen.findGraphicsTile('CURSORS', 1, 2)}
 local BAD_PEN = to_pen{ch='X', fg=COLOR_RED,
@@ -584,6 +594,7 @@ function Quickfort:onRenderFrame(dc, rect)
     if not tiles[cursor.z] then return end
 
     local function get_overlay_pen(pos)
+        if same_xyz(pos, self.saved_cursor) then return CURSOR_PEN end
         local preview_tile = quickfort_preview.get_preview_tile(tiles, pos)
         if preview_tile == nil then return end
         return preview_tile and GOOD_PEN or BAD_PEN
@@ -612,11 +623,13 @@ function Quickfort:commit()
 end
 
 function Quickfort:do_command(command, dry_run, post_fn)
-    print(('executing via gui/quickfort: quickfort %s'):format(
+    self.dirty = true
+    print(('executing via gui/quickfort: quickfort %s --cursor=%d,%d,%d'):format(
                 quickfort_parse.format_command(
-                    command, self.blueprint_name, self.section_name, dry_run)))
+                    command, self.blueprint_name, self.section_name, dry_run),
+                self.saved_cursor.x, self.saved_cursor.y, self.saved_cursor.z))
     local ctx = self:run_quickfort_command(command, dry_run, false)
-    quickfort_command.finish_command(ctx, self.section_name)
+    quickfort_command.finish_commands(ctx)
     if command == 'run' then
         if #ctx.messages > 0 then
             self._dialog = dialogs.showMessage(

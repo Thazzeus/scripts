@@ -16,23 +16,74 @@ end
 local GLOBAL_KEY = 'suspendmanager' -- used for state change hooks and persistence
 
 enabled = enabled or false
-preventblocking = preventblocking == nil and true or preventblocking
 
 eventful.enableEvent(eventful.eventType.JOB_INITIATED, 10)
 eventful.enableEvent(eventful.eventType.JOB_COMPLETED, 10)
+
+--- List of reasons for a job to be suspended
+---@enum reason
+REASON = {
+    --- The job is under water and dwarves will suspend the job when starting it
+    UNDER_WATER = 1,
+    --- The job is planned by buildingplan, but not yet ready to start
+    BUILDINGPLAN = 2,
+    --- Fuzzy risk detection of jobs blocking each other in shapes like corners
+    RISK_BLOCKING = 3,
+    --- Building job on top of an erasable designation (smoothing, carving, ...)
+    ERASE_DESIGNATION = 4,
+    --- Blocks a dead end (either a corridor or on top of a wall)
+    DEADEND = 5,
+}
+
+REASON_TEXT = {
+    [REASON.UNDER_WATER] = 'underwater',
+    [REASON.BUILDINGPLAN] = 'planned',
+    [REASON.RISK_BLOCKING] = 'blocking',
+    [REASON.ERASE_DESIGNATION] = 'designation',
+    [REASON.DEADEND] = 'dead end',
+}
+
+--- Suspension reasons from an external source
+--- SuspendManager does not actively suspend such jobs, but
+--- will not unsuspend them
+EXTERNAL_REASONS = {
+    [REASON.UNDER_WATER]=true,
+    [REASON.BUILDINGPLAN]=true,
+}
+
+---@class SuspendManager
+---@field preventBlocking boolean
+---@field suspensions table<integer, reason>
+---@field lastAutoRunTick integer
+SuspendManager = defclass(SuspendManager)
+SuspendManager.ATTRS {
+    --- When enabled, suspendmanager also tries to suspend blocking jobs,
+    --- when not enabled, it only cares about avoiding unsuspending jobs suspended externally
+    preventBlocking = false,
+
+    --- Current job suspensions with their reasons
+    suspensions = {},
+
+    --- Last tick where it was run automatically
+    lastAutoRunTick = -1,
+}
+
+--- SuspendManager instance kept between frames
+---@type SuspendManager
+Instance = Instance or SuspendManager{preventBlocking=true}
 
 function isEnabled()
     return enabled
 end
 
 function preventBlockingEnabled()
-    return preventblocking
+    return Instance.preventBlocking
 end
 
 local function persist_state()
     persist.GlobalTable[GLOBAL_KEY] = json.encode({
         enabled=enabled,
-        prevent_blocking=preventblocking,
+        prevent_blocking=Instance.preventBlocking,
     })
 end
 
@@ -41,9 +92,9 @@ end
 function update_setting(setting, value)
     if setting == "preventblocking" then
         if (value == "true" or value == true) then
-            preventblocking = true
+            Instance.preventBlocking = true
         elseif (value == "false" or value == false) then
-            preventblocking = false
+            Instance.preventBlocking = false
         else
             qerror(tostring(value) .. " is not a valid value for preventblocking, it must be true or false")
         end
@@ -92,6 +143,35 @@ local BUILDING_IMPASSABLE = {
     [df.building_type.BarsVertical]=true,
 }
 
+--- Designation job type that are erased if a building is built on top of it
+local ERASABLE_DESIGNATION = {
+    [df.job_type.CarveTrack]=true,
+    [df.job_type.SmoothFloor]=true,
+    [df.job_type.DetailFloor]=true,
+}
+
+--- Job types that impact suspendmanager
+--- Any completed pathable job can impact suspendmanager by allowing or disallowing
+--- access to construction job.
+--- Any job read by suspendmanager such as smoothing and carving can also impact
+--- job suspension, since it suspends construction job on top of it
+local FILTER_JOB_TYPES = utils.invert{
+    df.job_type.CarveRamp,
+    df.job_type.CarveTrack,
+    df.job_type.CarveUpDownStaircase,
+    df.job_type.CarveUpwardStaircase,
+    df.job_type.CarveDownwardStaircase,
+    df.job_type.ConstructBuilding,
+    df.job_type.DestroyBuilding,
+    df.job_type.DetailFloor,
+    df.job_type.Dig,
+    df.job_type.DigChannel,
+    df.job_type.FellTree,
+    df.job_type.SmoothFloor,
+    df.job_type.RemoveConstruction,
+    df.job_type.RemoveStairs,
+}
+
 --- Check if a building is blocking once constructed
 ---@param building building_constructionst|building
 ---@return boolean
@@ -104,18 +184,17 @@ local function isImpassable(building)
     end
 end
 
---- True if there is a construction plan to build an unwalkable tile
+--- If there is a construction plan to build an unwalkable tile, return the building
 ---@param pos coord
----@return boolean
+---@return building?
 local function plansToConstructImpassableAt(pos)
     --- @type building_constructionst|building
     local building = dfhack.buildings.findAtTile(pos)
-    if not building then return false end
-    if building.flags.exists then
-        -- The building is already created
-        return false
+    if not building then return nil end
+    if not building.flags.exists and isImpassable(building) then
+        return building
     end
-    return isImpassable(building)
+    return nil
 end
 
 --- Check if the tile can be walked on
@@ -162,7 +241,7 @@ local function riskOfStuckConstructionAt(pos)
 end
 
 --- Return true if this job is at risk of blocking another one
-function isBlocking(job)
+local function riskBlocking(job)
     -- Not a construction job, no risk
     if job.job_type ~= df.job_type.ConstructBuilding then return false end
 
@@ -186,43 +265,167 @@ function isBlocking(job)
     return false
 end
 
---- Return true with a reason if a job should be suspended.
---- It optionally takes in account the risk of creating stuck
---- construction buildings
---- @param job job
---- @param accountblocking boolean
-function shouldBeSuspended(job, accountblocking)
-    if accountblocking and isBlocking(job) then
-        return true, 'blocking'
+--- Analyzes the given job, and if it is at a dead end, follow the "corridor" and
+--- mark the jobs containing it as dead end blocking jobs
+function SuspendManager:suspendDeadend(start_job)
+    local building = dfhack.job.getHolder(start_job)
+    if not building then return end
+    local pos = {x=building.centerx,y=building.centery,z=building.z}
+
+    -- visited building ids of this potential dead end
+    local visited = {
+        [building.id] = true
+    }
+
+    --- Support dead ends of a maximum length of 1000
+    for _=0,1000 do
+        -- building plan on the way to the exit
+        ---@type building?
+        local exit = nil
+        for _,neighbourPos in pairs(neighbours(pos)) do
+            if not walkable(neighbourPos) then
+                -- non walkable neighbour, not an exit
+                goto continue
+            end
+
+            local impassablePlan = plansToConstructImpassableAt(neighbourPos)
+            if not impassablePlan then
+                -- walkable neighbour with no building scheduled, not in a dead end
+                return
+            end
+
+            if visited[impassablePlan.id] then
+                -- already visited, not an exit
+                goto continue
+            end
+
+            if exit then
+                -- more than one exit, not in a dead end
+                return
+            end
+
+            -- the building plan is a candidate to exit
+            exit = impassablePlan
+
+            ::continue::
+        end
+
+        if not exit then return end
+
+        -- exit is the single exit point of this corridor, suspend its construction job
+        -- and continue the exploration from its position
+        for _,job in ipairs(exit.jobs) do
+            if job.job_type == df.job_type.ConstructBuilding then
+                self.suspensions[job.id] = REASON.DEADEND
+            end
+        end
+        visited[exit.id] = true
+        pos = {x=exit.centerx,y=exit.centery,z=exit.z}
     end
-    return false, nil
 end
 
---- Return true with a reason if a job should not be unsuspended.
-function shouldStaySuspended(job, accountblocking)
-    -- External reasons to be suspended
-
-    if dfhack.maps.getTileFlags(job.pos).flow_size > 1 then
-        return true, 'underwater'
+--- Return true if the building overlaps with a tile with a designation flag
+---@param building building
+local function buildingOnDesignation(building)
+    local z = building.z
+    for x=building.x1,building.x2 do
+        for y=building.y1,building.y2 do
+            local flags, occupancy = dfhack.maps.getTileFlags(x,y,z)
+            if flags.dig ~= df.tile_dig_designation.No or
+                flags.smooth > 0 or
+                occupancy.carve_track_north or
+                occupancy.carve_track_east or
+                occupancy.carve_track_south or
+                occupancy.carve_track_west
+            then
+                return true
+            end
+        end
     end
+end
 
-    local bld = dfhack.job.getHolder(job)
-    if bld and buildingplan and buildingplan.isPlannedBuilding(bld) then
-        return true, 'buildingplan'
+--- Return the reason for suspending a job or nil if it should not be suspended
+--- @param job job
+--- @return reason?
+function SuspendManager:shouldBeSuspended(job)
+    local reason = self.suspensions[job.id]
+    if reason and EXTERNAL_REASONS[reason] then
+        -- don't actively suspend external reasons for suspension
+        return nil
     end
+    return reason
+end
 
-    -- Internal reasons to be suspended, determined by suspendmanager
-    return shouldBeSuspended(job, accountblocking)
+--- Return the reason for keeping a job suspended or nil if it can be unsuspended
+--- @param job job
+--- @return reason?
+function SuspendManager:shouldStaySuspended(job)
+    return self.suspensions[job.id]
+end
+
+--- Recompute the list of suspended jobs
+function SuspendManager:refresh()
+    self.suspensions = {}
+
+    for _,job in utils.listpairs(df.global.world.jobs.list) do
+        -- External reasons to suspend a job
+        if job.job_type == df.job_type.ConstructBuilding then
+            if dfhack.maps.getTileFlags(job.pos).flow_size > 1 then
+                self.suspensions[job.id]=REASON.UNDER_WATER
+            end
+
+            local bld = dfhack.job.getHolder(job)
+            if bld and buildingplan and buildingplan.isPlannedBuilding(bld) then
+                self.suspensions[job.id]=REASON.BUILDINGPLAN
+            end
+        end
+
+        if not self.preventBlocking then goto continue end
+
+        -- Internal reasons to suspend a job
+        if riskBlocking(job) then
+            self.suspensions[job.id]=REASON.RISK_BLOCKING
+        end
+
+        -- If this job is a dead end, mark jobs leading to it as dead end
+        self:suspendDeadend(job)
+
+        -- First designation protection check: tile with designation flag
+        if job.job_type == df.job_type.ConstructBuilding then
+            ---@type building
+            local building = dfhack.job.getHolder(job)
+            if building then
+                if buildingOnDesignation(building) then
+                    self.suspensions[job.id]=REASON.ERASE_DESIGNATION
+                end
+            end
+        end
+
+        -- Second designation protection check: designation job
+        if ERASABLE_DESIGNATION[job.job_type] then
+            local building = dfhack.buildings.findAtTile(job.pos)
+            if building ~= nil then
+                for _,building_job in ipairs(building.jobs) do
+                    if building_job.job_type == df.job_type.ConstructBuilding then
+                        self.suspensions[building_job.id]=REASON.ERASE_DESIGNATION
+                    end
+                end
+            end
+        end
+
+        ::continue::
+    end
 end
 
 local function run_now()
+    Instance:refresh()
     foreach_construction_job(function(job)
         if job.flags.suspend then
-            if not shouldStaySuspended(job, preventblocking) then
+            if not Instance:shouldStaySuspended(job) then
                 unsuspend(job)
             end
         else
-            if shouldBeSuspended(job, preventblocking) then
+            if Instance:shouldBeSuspended(job) then
                 suspend(job)
             end
         end
@@ -231,7 +434,9 @@ end
 
 --- @param job job
 local function on_job_change(job)
-    if preventblocking then
+    local tick = df.global.cur_year_tick
+    if Instance.preventBlocking and FILTER_JOB_TYPES[job.job_type] and tick ~= Instance.lastAutoRunTick then
+        Instance.lastAutoRunTick = tick
         -- Note: This method could be made incremental by taking in account the
         -- changed job
         run_now()
@@ -262,7 +467,7 @@ dfhack.onStateChange[GLOBAL_KEY] = function(sc)
 
     local persisted_data = json.decode(persist.GlobalTable[GLOBAL_KEY] or '')
     enabled = (persisted_data or {enabled=false})['enabled']
-    preventblocking = (persisted_data or {prevent_blocking=true})['prevent_blocking']
+    Instance.preventBlocking = (persisted_data or {prevent_blocking=true})['prevent_blocking']
     update_triggers()
 end
 
@@ -294,7 +499,7 @@ local function main(args)
         update_setting(positionals[2], positionals[3])
     elseif command == nil then
         print(string.format("suspendmanager is currently %s", (enabled and "enabled" or "disabled")))
-        if preventblocking then
+        if Instance.preventBlocking then
             print("It is configured to prevent construction jobs from blocking each others")
         else
             print("It is configured to unsuspend all jobs")

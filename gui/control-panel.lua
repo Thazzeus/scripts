@@ -36,9 +36,15 @@ local FORT_SERVICES = {
 }
 
 local FORT_AUTOSTART = {
+    'autobutcher target 50 50 14 2 BIRD_GOOSE',
+    'autobutcher target 50 50 14 2 BIRD_TURKEY',
+    'autobutcher target 50 50 14 2 BIRD_CHICKEN',
+    'autofarm threshold 150 grass_tail_pig',
     'ban-cooking all',
     'buildingplan set boulders false',
     'buildingplan set logs false',
+    'fix/blood-del fort',
+    'light-aquifers-only fort',
 }
 for _,v in ipairs(FORT_SERVICES) do
     table.insert(FORT_AUTOSTART, v)
@@ -53,6 +59,7 @@ local SYSTEM_SERVICES = {
 }
 local SYSTEM_USER_SERVICES = {
     'faststart',
+    'work-now',
 }
 for _,v in ipairs(SYSTEM_USER_SERVICES) do
     table.insert(SYSTEM_SERVICES, v)
@@ -77,6 +84,8 @@ local PREFERENCES = {
          desc='The delay before scrolling quickly when holding the mouse button down on a scrollbar, in ms.'},
         SCROLL_DELAY_MS={label='Mouse scroll repeat delay (ms)', type='int', default=20, min=5,
          desc='The delay between events when holding the mouse button down on a scrollbar, in ms.'},
+        FILTER_FULL_TEXT={label='DFHack list filters search full text', type='bool', default=false,
+         desc='Whether to search for a match in the full text (true) or just at the start of words (false).'},
     },
 }
 
@@ -93,6 +102,9 @@ local REPEATS = {
     ['combine']={
         desc='Combine partial stacks in stockpiles into full stacks.',
         command={'--time', '7', '--timeUnits', 'days', '--command', '[', 'combine', 'all', '-q', ']'}},
+    ['stuck-instruments']={
+        desc='Fix activity references on stuck instruments to make them usable again.',
+        command={'--time', '1', '--timeUnits', 'days', '--command', '[', 'fix/stuck-instruments', ']'}},
     ['general-strike']={
         desc='Prevent dwarves from getting stuck and refusing to work.',
         command={'--time', '1', '--timeUnits', 'days', '--command', '[', 'fix/general-strike', '-q', ']'}},
@@ -350,12 +362,20 @@ function Services:get_enabled_map()
     return enabled_map
 end
 
+local function get_first_word(text)
+    local word = text:trim():split(' +')[1]
+    if word:startswith(':') then word = word:sub(2) end
+    return word
+end
+
 function Services:get_choices()
     local enabled_map = self:get_enabled_map()
     local choices = {}
     local hide_armok = dfhack.getHideArmokTools()
     for _,service in ipairs(self.services_list) do
-        if not hide_armok or not helpdb.is_entry(service) or not helpdb.get_entry_tags(service).armok then
+        local entry_name = get_first_word(service)
+        if not hide_armok or not helpdb.is_entry(entry_name)
+                or not helpdb.get_entry_tags(entry_name).armok then
             table.insert(choices, {target=service, enabled=enabled_map[service]})
         end
     end
@@ -626,18 +646,16 @@ function Preferences:refresh()
     for ctx_name,settings in pairs(PREFERENCES) do
         local ctx_env = require(ctx_name)
         for id,spec in pairs(settings) do
+            local label = ('%s (%s)'):format(spec.label, ctx_env[id])
             local text = {
                 {tile=BUTTON_PEN_LEFT},
                 {tile=CONFIGURE_PEN_CENTER},
                 {tile=BUTTON_PEN_RIGHT},
                 ' ',
-                spec.label,
-                ' (',
-                tostring(ctx_env[id]),
-                ')',
+                label,
             }
             table.insert(choices,
-                {text=text, desc=spec.desc, search_key=id,
+                {text=text, desc=spec.desc, search_key=label,
                  ctx_env=ctx_env, id=id, spec=spec})
         end
     end
@@ -795,150 +813,13 @@ function RepeatAutostart:on_submit()
 end
 
 --
--- Tab
----
-
-local to_pen = dfhack.pen.parse
-local active_tab_pens = {
-    text_mode_tab_pen=to_pen{fg=COLOR_YELLOW},
-    text_mode_label_pen=to_pen{fg=COLOR_WHITE},
-    lt=to_pen{tile=1005, write_to_lower=true},
-    lt2=to_pen{tile=1006, write_to_lower=true},
-    t=to_pen{tile=1007, fg=COLOR_BLACK, write_to_lower=true, top_of_text=true},
-    rt2=to_pen{tile=1008, write_to_lower=true},
-    rt=to_pen{tile=1009, write_to_lower=true},
-    lb=to_pen{tile=1015, write_to_lower=true},
-    lb2=to_pen{tile=1016, write_to_lower=true},
-    b=to_pen{tile=1017, fg=COLOR_BLACK, write_to_lower=true, bottom_of_text=true},
-    rb2=to_pen{tile=1018, write_to_lower=true},
-    rb=to_pen{tile=1019, write_to_lower=true},
-}
-
-local inactive_tab_pens = {
-    text_mode_tab_pen=to_pen{fg=COLOR_BROWN},
-    text_mode_label_pen=to_pen{fg=COLOR_DARKGREY},
-    lt=to_pen{tile=1000, write_to_lower=true},
-    lt2=to_pen{tile=1001, write_to_lower=true},
-    t=to_pen{tile=1002, fg=COLOR_WHITE, write_to_lower=true, top_of_text=true},
-    rt2=to_pen{tile=1003, write_to_lower=true},
-    rt=to_pen{tile=1004, write_to_lower=true},
-    lb=to_pen{tile=1010, write_to_lower=true},
-    lb2=to_pen{tile=1011, write_to_lower=true},
-    b=to_pen{tile=1012, fg=COLOR_WHITE, write_to_lower=true, bottom_of_text=true},
-    rb2=to_pen{tile=1013, write_to_lower=true},
-    rb=to_pen{tile=1014, write_to_lower=true},
-}
-
-Tab = defclass(Tabs, widgets.Widget)
-Tab.ATTRS{
-    id=DEFAULT_NIL,
-    label=DEFAULT_NIL,
-    on_select=DEFAULT_NIL,
-    get_pens=DEFAULT_NIL,
-}
-
-function Tab:preinit(init_table)
-    init_table.frame = init_table.frame or {}
-    init_table.frame.w = #init_table.label + 4
-    init_table.frame.h = 2
-end
-
-function Tab:onRenderBody(dc)
-    local pens = self.get_pens()
-    dc:seek(0, 0)
-    if dfhack.screen.inGraphicsMode() then
-        dc:char(nil, pens.lt):char(nil, pens.lt2)
-        for i=1,#self.label do
-            dc:char(self.label:sub(i,i), pens.t)
-        end
-        dc:char(nil, pens.rt2):char(nil, pens.rt)
-        dc:seek(0, 1)
-        dc:char(nil, pens.lb):char(nil, pens.lb2)
-        for i=1,#self.label do
-            dc:char(self.label:sub(i,i), pens.b)
-        end
-        dc:char(nil, pens.rb2):char(nil, pens.rb)
-    else
-        local tp = pens.text_mode_tab_pen
-        dc:char(' ', tp):char('/', tp)
-        for i=1,#self.label do
-            dc:char('-', tp)
-        end
-        dc:char('\\', tp):char(' ', tp)
-        dc:seek(0, 1)
-        dc:char('/', tp):char('-', tp)
-        dc:string(self.label, pens.text_mode_label_pen)
-        dc:char('-', tp):char('\\', tp)
-    end
-end
-
-function Tab:onInput(keys)
-    if Tab.super.onInput(self, keys) then return true end
-    if keys._MOUSE_L_DOWN and self:getMousePos() then
-        self.on_select(self.id)
-        return true
-    end
-end
-
---
--- TabBar
---
-
-TabBar = defclass(TabBar, widgets.ResizingPanel)
-TabBar.ATTRS{
-    labels=DEFAULT_NIL,
-    on_select=DEFAULT_NIL,
-    get_cur_page=DEFAULT_NIL,
-}
-
-function TabBar:init()
-    for idx,label in ipairs(self.labels) do
-        self:addviews{
-            Tab{
-                frame={t=0, l=0},
-                id=idx,
-                label=label,
-                on_select=self.on_select,
-                get_pens=function()
-                    return self.get_cur_page() == idx and
-                            active_tab_pens or inactive_tab_pens
-                end,
-            }
-        }
-    end
-end
-
-function TabBar:postComputeFrame(body)
-    local t, l, width = 0, 0, body.width
-    for _,tab in ipairs(self.subviews) do
-        if l > 0 and l + tab.frame.w > width then
-            t = t + 2
-            l = 0
-        end
-        tab.frame.t = t
-        tab.frame.l = l
-        l = l + tab.frame.w
-    end
-end
-
-function TabBar:onInput(keys)
-    if TabBar.super.onInput(self, keys) then return true end
-    if keys.CUSTOM_CTRL_T then
-        local zero_idx = self.get_cur_page() - 1
-        local next_zero_idx = (zero_idx + 1) % #self.labels
-        self.on_select(next_zero_idx + 1)
-        return true
-    end
-end
-
---
 -- ControlPanel
 --
 
 ControlPanel = defclass(ControlPanel, widgets.Window)
 ControlPanel.ATTRS {
     frame_title='DFHack Control Panel',
-    frame={w=55, h=36},
+    frame={w=61, h=36},
     resizable=true,
     resize_min={h=28},
     autoarrange_subviews=true,
@@ -947,7 +828,7 @@ ControlPanel.ATTRS {
 
 function ControlPanel:init()
     self:addviews{
-        TabBar{
+        widgets.TabBar{
             frame={t=0},
             labels={
                 'Fort',
@@ -958,7 +839,7 @@ function ControlPanel:init()
                 'Autostart',
             },
             on_select=self:callback('set_page'),
-            get_cur_page=function() return self.subviews.pages:getSelected() end
+            get_cur_page=function() return self.subviews.pages:getSelected() end,
         },
         widgets.Pages{
             view_id='pages',

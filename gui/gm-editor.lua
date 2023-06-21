@@ -1,4 +1,5 @@
 -- Interface powered memory object editor.
+--@module=true
 
 local gui = require 'gui'
 local json = require 'json'
@@ -8,6 +9,8 @@ local guiScript = require 'gui.script'
 local utils = require 'utils'
 
 config = config or json.open('dfhack-config/gm-editor.json')
+
+local REFRESH_MS = 100
 
 function save_config(data)
     utils.assign(config.data, data)
@@ -26,6 +29,7 @@ end)()
 
 local keybindings_raw = {
     {name='toggle_ro', key="CUSTOM_CTRL_D",desc="Toggle between read-only and read-write"},
+    {name='autoupdate', key="CUSTOM_ALT_A",desc="See live updates of changing values"},
     {name='offset', key="CUSTOM_ALT_O",desc="Show current items offset"},
     {name='find', key="CUSTOM_F",desc="Find a value by entering a predicate"},
     {name='find_id', key="CUSTOM_I",desc="Find object with this ID, using ref-target if available"},
@@ -52,7 +56,7 @@ end
 function getTargetFromScreens()
     local my_trg = dfhack.gui.getSelectedUnit(true) or dfhack.gui.getSelectedItem(true)
             or dfhack.gui.getSelectedJob(true) or dfhack.gui.getSelectedBuilding(true)
-            or dfhack.gui.getSelectedStockpile(true)
+            or dfhack.gui.getSelectedStockpile(true) or dfhack.gui.getSelectedCivZone(true)
     if not my_trg then
         qerror("No valid target found")
     end
@@ -144,6 +148,42 @@ function GmEditorUi:init(args)
 
     self:addviews{widgets.Pages{subviews={mainPage,helpPage},view_id="pages"}}
     self:pushTarget(args.target)
+end
+function GmEditorUi:verifyStack()
+    local failure = false
+
+    local last_good_level = nil
+
+    for i, level in pairs(self.stack) do
+        local obj=level.target
+        if obj._kind == "bitfield" or obj._kind == "struct" then goto continue end
+
+        local keys = level.keys
+        local selection = level.selected
+        local sel_key = keys[selection]
+        if not sel_key then goto continue end
+        local next_by_ref
+        local status, _ = pcall(
+        function()
+            next_by_ref = obj[sel_key]
+            end
+        )
+        if not status then
+            failure = true
+            last_good_level = i - 1
+            break
+        end
+        if not self.stack[i+1] == next_by_ref then
+            failure = true
+            break
+        end
+        ::continue::
+    end
+    if failure then
+        self.stack = {table.unpack(self.stack, 1, last_good_level)}
+        return false
+    end
+    return true
 end
 function GmEditorUi:text_input(new_text)
     self:updateTarget(true,true)
@@ -340,7 +380,7 @@ function GmEditorUi:editSelectedEnum(index,choice)
 end
 function GmEditorUi:openReinterpret(key)
     local trg=self:currentTarget()
-    dialog.showInputPrompt(tostring(trg_key),"Enter new type:",COLOR_WHITE,
+    dialog.showInputPrompt(tostring(self:getSelectedKey()),"Enter new type:",COLOR_WHITE,
                 "",function(choice)
                     local ntype=df[choice]
                     self:pushTarget(df.reinterpret_cast(ntype,trg.target[key]))
@@ -349,7 +389,6 @@ end
 function GmEditorUi:openOffseted(index,choice)
     local trg=self:currentTarget()
     local trg_key=trg.keys[index]
-
     dialog.showInputPrompt(tostring(trg_key),"Enter offset:",COLOR_WHITE,"",
         function(choice)
             self:pushTarget(trg.target[trg_key]:_displace(tonumber(choice)))
@@ -399,6 +438,10 @@ function GmEditorUi:editSelectedRaw(index,choice)
     self:editSelected(index, choice, {raw=true})
 end
 function GmEditorUi:editSelected(index,choice,opts)
+    if not self:verifyStack() then
+        self:updateTarget()
+        return
+    end
     opts = opts or {}
     local trg=self:currentTarget()
     local trg_key=trg.keys[index]
@@ -407,7 +450,6 @@ function GmEditorUi:editSelected(index,choice,opts)
         trg.target[trg_key]= not trg.target[trg_key]
         self:updateTarget(true)
     else
-        --print(type(trg.target[trg.keys[trg.selected]]),trg.target[trg.keys[trg.selected]]._kind or "")
         local trg_type=type(trg.target[trg_key])
         if self:getSelectedEnumType() and not opts.raw then
             if self.read_only then return end
@@ -483,6 +525,9 @@ function GmEditorUi:onInput(keys)
         self.read_only = not self.read_only
         self:updateTitles()
         return true
+    elseif keys[keybindings.autoupdate.key] then
+        self.autoupdate = not self.autoupdate
+        return true
     elseif keys[keybindings.offset.key] then
         local trg=self:currentTarget()
         local _,stoff=df.sizeof(trg.target)
@@ -521,6 +566,7 @@ function GmEditorUi:onInput(keys)
         return true
     end
 end
+
 function getStringValue(trg,field)
     local obj=trg.target
 
@@ -558,6 +604,7 @@ function GmEditorUi:updateTitles()
     save_config({read_only = self.read_only})
 end
 function GmEditorUi:updateTarget(preserve_pos,reindex)
+    self:verifyStack()
     local trg=self:currentTarget()
     local filter=self.subviews.filter_input.text:lower()
 
@@ -583,17 +630,20 @@ function GmEditorUi:updateTarget(preserve_pos,reindex)
     for k,v in pairs(trg.keys) do
         table.insert(t,{text={{text=string.format("%-"..trg.kw.."s",tostring(v))},{gap=2,text=getStringValue(trg,v)}}})
     end
-    local last_pos
+    local last_selected, last_top
     if preserve_pos then
-        last_pos=self.subviews.list_main:getSelected()
+        last_selected=self.subviews.list_main:getSelected()
+        last_top=self.subviews.list_main.page_top
     end
     self.subviews.list_main:setChoices(t)
-    if last_pos then
-        self.subviews.list_main:setSelected(last_pos)
+    if last_selected then
+        self.subviews.list_main:setSelected(last_selected)
+        self.subviews.list_main:on_scrollbar(last_top)
     else
         self.subviews.list_main:setSelected(trg.selected)
     end
     self:updateTitles()
+    self.next_refresh_ms = dfhack.getTickCount() + REFRESH_MS
 end
 function GmEditorUi:pushTarget(target_to_push)
     local new_tbl={}
@@ -633,6 +683,60 @@ end
 function GmEditorUi:postUpdateLayout()
     save_config({frame = self.frame})
 end
+function GmEditorUi:onRenderFrame(dc, rect)
+    GmEditorUi.super.onRenderFrame(self, dc, rect)
+    if self.parent_view.freeze then
+        dc:seek(rect.x1+2, rect.y2):string(' GAME SUSPENDED ', COLOR_RED)
+    end
+    if self.autoupdate and self.next_refresh_ms <= dfhack.getTickCount() then
+        self:updateTarget(true, true)
+    end
+end
+
+FreezeScreen = defclass(FreezeScreen, gui.Screen)
+FreezeScreen.ATTRS{
+    focus_path='gm-editor/freeze',
+}
+
+function FreezeScreen:init()
+    self:addviews{
+        widgets.Panel{
+            frame_background=gui.CLEAR_PEN,
+            subviews={
+                widgets.Label{
+                    frame={t=0, l=1},
+                    auto_width=true,
+                    text='Dwarf Fortress is currently suspended by gui/gm-editor',
+                },
+                widgets.Label{
+                    frame={t=0, r=1},
+                    auto_width=true,
+                    text='Dwarf Fortress is currently suspended by gui/gm-editor',
+                },
+                widgets.Label{
+                    frame={},
+                    auto_width=true,
+                    text='Dwarf Fortress is currently suspended by gui/gm-editor',
+                },
+                widgets.Label{
+                    frame={b=0, l=1},
+                    auto_width=true,
+                    text='Dwarf Fortress is currently suspended by gui/gm-editor',
+                },
+                widgets.Label{
+                    frame={b=0, r=1},
+                    auto_width=true,
+                    text='Dwarf Fortress is currently suspended by gui/gm-editor',
+                },
+            },
+        },
+    }
+    freeze_screen = self
+end
+
+function FreezeScreen:onDismiss()
+    freeze_screen = nil
+end
 
 GmScreen = defclass(GmScreen, gui.ZScreen)
 GmScreen.ATTRS {
@@ -640,25 +744,41 @@ GmScreen.ATTRS {
     freeze=false,
 }
 
+local function has_frozen_view()
+    for view in pairs(views) do
+        if view.freeze then
+            return true
+        end
+    end
+    return false
+end
+
 function GmScreen:init(args)
     local target = args.target
     if not target then
         qerror('Target not found')
     end
-    self.force_pause = self.freeze
-    self:addviews{GmEditorUi{target=target}}
-end
-
-function GmScreen:onIdle()
-    if not self.freeze then
-        GmScreen.super.onIdle(self)
-    elseif self.force_pause and dfhack.isMapLoaded() then
-        df.global.pause_state = true
+    if self.freeze then
+        self.force_pause = true
+        if not has_frozen_view() then
+            FreezeScreen{}:show()
+            -- raise existing views above the freeze screen
+            for view in pairs(views) do
+                view:raise()
+            end
+        end
     end
+    self:addviews{GmEditorUi{target=target}}
+    views[self] = true
 end
 
 function GmScreen:onDismiss()
     views[self] = nil
+    if freeze_screen then
+        if not has_frozen_view() then
+            freeze_screen:dismiss()
+        end
+    end
 end
 
 local function get_editor(args)
@@ -671,18 +791,27 @@ local function get_editor(args)
         if args[1]=="dialog" then
             dialog.showInputPrompt("Gm Editor", "Object to edit:", COLOR_GRAY,
                     "", function(entry)
-                        local view = GmScreen{freeze=freeze, target=eval(entry)}:show()
-                        views[view] = true
+                        GmScreen{freeze=freeze, target=eval(entry)}:show()
                     end)
         elseif args[1]=="free" then
-            return GmScreen{freeze=freeze, target=df.reinterpret_cast(df[args[2]],args[3])}:show()
+            GmScreen{freeze=freeze, target=df.reinterpret_cast(df[args[2]],args[3])}:show()
+        elseif args[1]=="scr" then
+            -- this will not work for more complicated expressions, like scr.fieldname, but
+            -- it should capture the most common case
+            GmScreen{freeze=freeze, target=dfhack.gui.getDFViewscreen(true)}:show()
         else
-            return GmScreen{freeze=freeze, target=eval(args[1])}:show()
+            GmScreen{freeze=freeze, target=eval(args[1])}:show()
         end
     else
-        return GmScreen{freeze=freeze, target=getTargetFromScreens()}:show()
+        GmScreen{freeze=freeze, target=getTargetFromScreens()}:show()
     end
 end
 
 views = views or {}
-views[get_editor{...}] = true
+freeze_screen = freeze_screen or nil
+
+if dfhack_flags.module then
+    return
+end
+
+get_editor{...}
